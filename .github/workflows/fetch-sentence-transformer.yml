@@ -1,0 +1,73 @@
+name: Fetch sentence-transformer model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Hugging Face model (sentence-transformers format)"
+        default: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODEL: ${{ inputs.model }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install huggingface_hub
+
+      - name: Download model
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id=os.environ["MODEL"],
+              local_dir="model",
+          )
+          PY
+          echo "--- files ---"
+          ls -la model/
+
+      - name: Split and publish to branch
+        run: |
+          set -euo pipefail
+          BRANCH="st-model-$(basename "$MODEL")"
+          mkdir out
+
+          # העתק כל הקבצים חוץ מהקבצים הגדולים
+          find model -maxdepth 2 -type f ! -name "*.bin" ! -name "*.safetensors" -exec cp --parents {} out/ \;
+
+          # פצל את הקובץ הגדול לחלקים של 40MB
+          for big in model/*.bin model/*.safetensors; do
+            [ -f "$big" ] || continue
+            fname=$(basename "$big")
+            split -b 40m -d -a 3 "$big" "out/model/$fname.part"
+            (cd model && sha256sum "$fname") >> out/model/SHA256SUMS
+          done
+
+          echo "$MODEL" > out/model/SOURCE
+          ls -laR out/
+
+          cd out
+          git init -q
+          git checkout -q -b "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Model $MODEL"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$BRANCH"
+          echo "### Model published to branch \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch name: \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
