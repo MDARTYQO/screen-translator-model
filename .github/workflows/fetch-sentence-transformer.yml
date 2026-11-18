@@ -15,8 +15,6 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      MODEL: ${{ inputs.model }}
 
     steps:
       - uses: actions/checkout@v4
@@ -28,46 +26,63 @@ jobs:
       - name: Install dependencies
         run: pip install huggingface_hub
 
-      - name: Download model
+      - name: Download and split model
+        env:
+          MODEL: ${{ inputs.model }}
         run: |
           python - <<'PY'
-          import os
+          import os, shutil, math
+          from pathlib import Path
           from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id=os.environ["MODEL"],
-              local_dir="model",
-          )
+
+          model_id = os.environ["MODEL"]
+          branch = "st-model-" + model_id.split("/")[-1]
+
+          print(f"Downloading {model_id} ...")
+          snapshot_download(repo_id=model_id, local_dir="model")
+
+          out = Path("out")
+          out.mkdir()
+
+          SPLIT_SIZE = 40 * 1024 * 1024  # 40MB
+
+          for src in Path("model").rglob("*"):
+              if not src.is_file():
+                  continue
+              rel = src.relative_to("model")
+              if src.stat().st_size > SPLIT_SIZE:
+                  # split large file
+                  dest_dir = out / rel.parent
+                  dest_dir.mkdir(parents=True, exist_ok=True)
+                  data = src.read_bytes()
+                  total = math.ceil(len(data) / SPLIT_SIZE)
+                  for i in range(total):
+                      chunk = data[i*SPLIT_SIZE:(i+1)*SPLIT_SIZE]
+                      (dest_dir / f"{rel.name}.part{i:03d}").write_bytes(chunk)
+                  print(f"Split {rel} into {total} parts")
+              else:
+                  dest = out / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dest)
+
+          (out / "SOURCE").write_text(model_id)
+          print("Done. Files in out/:")
+          for f in sorted(out.rglob("*")):
+              if f.is_file():
+                  print(f"  {f.relative_to(out)} ({f.stat().st_size:,} bytes)")
+
+          Path("branch_name.txt").write_text(branch)
           PY
-          echo "--- files ---"
-          ls -la model/
 
-      - name: Split and publish to branch
+      - name: Publish to branch
         run: |
-          set -euo pipefail
-          BRANCH="st-model-$(basename "$MODEL")"
-          mkdir out
-
-          # העתק כל הקבצים חוץ מהקבצים הגדולים
-          find model -maxdepth 2 -type f ! -name "*.bin" ! -name "*.safetensors" -exec cp --parents {} out/ \;
-
-          # פצל את הקובץ הגדול לחלקים של 40MB
-          for big in model/*.bin model/*.safetensors; do
-            [ -f "$big" ] || continue
-            fname=$(basename "$big")
-            split -b 40m -d -a 3 "$big" "out/model/$fname.part"
-            (cd model && sha256sum "$fname") >> out/model/SHA256SUMS
-          done
-
-          echo "$MODEL" > out/model/SOURCE
-          ls -laR out/
-
+          BRANCH=$(cat branch_name.txt)
           cd out
           git init -q
           git checkout -q -b "$BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "Model $MODEL"
+          git commit -q -m "Model $BRANCH"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$BRANCH"
-          echo "### Model published to branch \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Branch name: \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published to branch: $BRANCH"
