@@ -19,6 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Git LFS
+        run: git lfs install
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -26,63 +29,33 @@ jobs:
       - name: Install dependencies
         run: pip install huggingface_hub
 
-      - name: Download and split model
+      - name: Download model
         env:
           MODEL: ${{ inputs.model }}
         run: |
           python - <<'PY'
-          import os, shutil, math
-          from pathlib import Path
+          import os
           from huggingface_hub import snapshot_download
-
           model_id = os.environ["MODEL"]
-          branch = "st-model-" + model_id.split("/")[-1]
-
           print(f"Downloading {model_id} ...")
-          snapshot_download(repo_id=model_id, local_dir="model")
-
-          out = Path("out")
-          out.mkdir()
-
-          SPLIT_SIZE = 40 * 1024 * 1024  # 40MB
-
-          for src in Path("model").rglob("*"):
-              if not src.is_file():
-                  continue
-              rel = src.relative_to("model")
-              if src.stat().st_size > SPLIT_SIZE:
-                  # split large file
-                  dest_dir = out / rel.parent
-                  dest_dir.mkdir(parents=True, exist_ok=True)
-                  data = src.read_bytes()
-                  total = math.ceil(len(data) / SPLIT_SIZE)
-                  for i in range(total):
-                      chunk = data[i*SPLIT_SIZE:(i+1)*SPLIT_SIZE]
-                      (dest_dir / f"{rel.name}.part{i:03d}").write_bytes(chunk)
-                  print(f"Split {rel} into {total} parts")
-              else:
-                  dest = out / rel
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(src, dest)
-
-          (out / "SOURCE").write_text(model_id)
-          print("Done. Files in out/:")
-          for f in sorted(out.rglob("*")):
-              if f.is_file():
-                  print(f"  {f.relative_to(out)} ({f.stat().st_size:,} bytes)")
-
-          Path("branch_name.txt").write_text(branch)
+          snapshot_download(repo_id=model_id, local_dir="out")
           PY
+          ls -la out/
 
       - name: Publish to branch
+        env:
+          MODEL: ${{ inputs.model }}
         run: |
-          BRANCH=$(cat branch_name.txt)
+          BRANCH="st-model-$(basename "$MODEL")"
           cd out
           git init -q
+          git lfs install
+          git lfs track "*.safetensors" "*.bin"
+          git add .gitattributes
           git checkout -q -b "$BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -q -m "Model $BRANCH"
+          git commit -q -m "Model $MODEL"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$BRANCH"
           echo "Published to branch: $BRANCH"
